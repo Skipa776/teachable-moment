@@ -1,0 +1,14 @@
+{
+  "name": "teachable-moment",
+  "description": "Step through the edits Claude made this session and ask a Teacher subagent to explain any of them.",
+  "owner": {
+    "name": "Skipa776"
+  },
+  "plugins": [
+    {
+      "name": "teachable-moment",
+      "source": "./",
+      "description": "Step through the edits Claude made this session and ask a Teacher subagent to explain any of them."
+    }
+  ]
+}
