@@ -474,6 +474,14 @@ async function agentTypeOf($: Engine, s: State, agentId: string, retry = false):
 // An agent loop this mod started (the Teacher's): its edits and turns are never recorded.
 export const isOurs = (s: Pick<State, 'spawned' | 'waiting'>, agentId: string) => s.spawned.has(agentId) || s.waiting.has(agentId)
 
+// A background-task notification about one of our Teachers: the pane already
+// has its answer, so it must not reach the main model as a new prompt.
+export function isOurNotification(s: Pick<State, 'spawned' | 'waiting'>, origin: { kind: string }, text: string): boolean {
+  if (origin.kind !== 'task-notification') return false
+  for (const id of [...s.spawned, ...s.waiting.keys()]) if (text.includes(id)) return true
+  return false
+}
+
 // A Teacher turn that ended before spawn() handed back its id: keep the last few.
 // Not for a subagent we already know of, so a busy one cannot push a Teacher's answer out.
 function rememberEarly(s: State, agentId: string, e: Finished) {
@@ -739,6 +747,11 @@ export const register: Register = (on, options) => {
 
   // The Teacher is ours alone: never offered to the model.
   on('agent.offer', { agent: AGENT_TYPE }, () => ({ isOffered: false }))
+
+  // The Teacher runs in the background, so the engine posts a "task finished"
+  // notification to the main conversation when it ends. Drop ours.
+  on('prompt.submit', ($, e, next) =>
+    isOurNotification(s, e.origin, e.text) ? { drop: 'Teachable Moment: Teacher finished (shown in the pane)' } : next(e))
 
   on('session.start', async ($, e, next) => {
     const r = await next(e)

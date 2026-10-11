@@ -3,7 +3,7 @@ import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 import type { State } from '../hooks/teachable-moment'
-import { allocateBudget, cleanText, commitDrafts, explanationFor, isOurs, layoutRows, orderSteps, paneSize, parseExplanation, wrapText } from '../hooks/teachable-moment'
+import { allocateBudget, cleanText, commitDrafts, explanationFor, isOurNotification, isOurs, layoutRows, orderSteps, paneSize, parseExplanation, wrapText } from '../hooks/teachable-moment'
 
 const PLUGIN = 'teachable-moment'
 const PANE_PROPS = {
@@ -514,5 +514,16 @@ describe('sizing', () => {
     await view.redraw({ ...PANE_PROPS, bodyColumns: 100, scroll: { offset: 0, bodyRows: 20 } })
     expect(await diffTexts(view)).toBe(10) // 20 - 9 chrome - the "more" row
     expect(await view.find({ type: 'Text', text: /… \d+ more lines/ })).toBeDefined()
+  })
+})
+
+describe('Teacher notifications', () => {
+  test("only our Teachers' task notifications are dropped", () => {
+    const s = { spawned: new Set(['teacher-1']), waiting: new Map([['teacher-2', {} as never]]) }
+    const note = (id: string) => `<task-notification><task-id>${id}</task-id><status>completed</status></task-notification>`
+    expect(isOurNotification(s, { kind: 'task-notification' }, note('teacher-1'))).toBe(true)
+    expect(isOurNotification(s, { kind: 'task-notification' }, note('teacher-2'))).toBe(true)
+    expect(isOurNotification(s, { kind: 'task-notification' }, note('worker-7'))).toBe(false)
+    expect(isOurNotification(s, { kind: 'user' }, 'mention teacher-1 in a prompt')).toBe(false)
   })
 })
