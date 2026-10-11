@@ -3,7 +3,7 @@ import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 import type { State } from '../hooks/teachable-moment'
-import { allocateBudget, cleanText, commitDrafts, explanationFor, isOurs, orderSteps, parseExplanation, wrapText } from '../hooks/teachable-moment'
+import { allocateBudget, cleanText, commitDrafts, explanationFor, isOurs, layoutRows, orderSteps, paneSize, parseExplanation, wrapText } from '../hooks/teachable-moment'
 
 const PLUGIN = 'teachable-moment'
 const PANE_PROPS = {
@@ -431,5 +431,88 @@ describe('explaining', () => {
       agent: 'teachable-moment:teacher', description: 'x', source: 'plugin', provider: { plugin: PLUGIN, tier: 'user' },
     })
     expect(offer.isOffered).toBe(false)
+  })
+})
+
+describe('sizing', () => {
+  const sizedPane = ($: Engine, bodyRows: number, bodyColumns = 100) =>
+    $.ui.mount({
+      plugin: PLUGIN, surface: 'terminal', component: 'Pane', requestId: PLUGIN,
+      props: { ...PANE_PROPS, bodyColumns, scroll: { offset: 0, bodyRows } },
+    })
+  const diffTexts = async (view: Awaited<ReturnType<typeof sizedPane>>) =>
+    (await view.findAll({ type: 'Text', text: /^[+-] (old|new) \d+/ })).length
+
+  test("the pane is asked for the terminal's room: 100 columns until the size is known, then width - 4 within 72..120", () => {
+    expect(paneSize(undefined)).toEqual({ rows: 60, columns: 100 })
+    expect(paneSize({ columns: 160, rows: 60 })).toEqual({ rows: 58, columns: 120 })
+    expect(paneSize({ columns: 110, rows: 50 })).toEqual({ rows: 48, columns: 106 })
+    expect(paneSize({ columns: 80, rows: 24 })).toEqual({ rows: 30, columns: 76 })
+    expect(paneSize({ columns: 60, rows: 24 }).columns).toBe(72)
+  })
+
+  test('the open call carries the size taken from the last render', async ($, on) => {
+    engineBeneath(on)
+    const opens: Array<{ rows?: number; columns?: number }> = []
+    on('ui.open', (_$, e) => { opens.push(e); return { value: { isPlaced: true } } })
+    const clock = mock.clock(on)
+    await $.tool.call(edit('/p/a.ts', 'one', 'two'))
+    await endTurn($, 't1')
+    await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', component: 'AbovePrompt', props: BAND_PROPS, viewport: { columns: 160, rows: 60, isFullscreen: true } })
+
+    const run = teach($)
+    await clock.advance(200)
+    await run
+    expect(opens).toHaveLength(1)
+    expect(opens[0]).toMatchObject({ rows: 58, columns: 120 })
+  })
+
+  // The test kit cannot hand the mod a finished Teacher answer (it strips the
+  // spawn's agentId), so the sharing of rows is checked on the layout function the
+  // view calls, and the diff's share through the real view.
+  test('a long done explanation fits whole in a big pane, with no scroll buttons', () => {
+    // A 160x60 terminal: 25 explanation lines beside the whole diff.
+    expect(layoutRows(56, 5, 25)).toEqual({ diffLines: 5, explanationLines: 25, needsScroll: false })
+    // A 12-line diff still fits beside it: 9 chrome + 2 + 13 + 25 = 49 <= 56.
+    expect(layoutRows(56, 40, 25)).toEqual({ diffLines: 12, explanationLines: 25, needsScroll: false })
+    // Less room: the diff shrinks (not below 3) before the explanation is cut.
+    expect(layoutRows(42, 40, 25)).toEqual({ diffLines: 5, explanationLines: 25, needsScroll: false })
+  })
+
+  test('a small terminal windows the explanation and asks for the scroll buttons', () => {
+    const tight = layoutRows(20, 5, 25) // an 80x24 terminal
+    expect(tight.needsScroll).toBe(true)
+    expect(tight.diffLines).toBe(3)
+    expect(tight.explanationLines).toBeGreaterThanOrEqual(3)
+    expect(tight.explanationLines).toBeLessThan(25)
+    // chrome + explanation chrome + diff and its "more" row + window + scroll row fits the budget
+    expect(9 + 2 + 4 + tight.explanationLines + 1).toBeLessThanOrEqual(20)
+  })
+
+  test('the explanation is windowed only when the wrapped text is one line too many', () => {
+    const total = wrapText('word '.repeat(300), 96).length + 2 // plus the two headings
+    expect(total).toBeGreaterThan(10)
+    const need = 9 + 2 + 4 + total // chrome, explanation chrome, 3 diff lines and their "more" row
+    expect(layoutRows(need, 50, total).needsScroll).toBe(false)
+    expect(layoutRows(need - 1, 50, total).needsScroll).toBe(true)
+  })
+
+  test('with no explanation the diff grows with the room, to 30 lines', () => {
+    expect(layoutRows(56, 100, undefined).diffLines).toBe(30)
+    expect(layoutRows(30, 100, undefined).diffLines).toBe(20) // 30 - 9 chrome - the "more" row
+    expect(layoutRows(30, 8, undefined).diffLines).toBe(8)
+    expect(layoutRows(10, 100, undefined).diffLines).toBe(3)
+    expect(layoutRows(30, 0, undefined).diffLines).toBe(0)
+  })
+
+  test('the pane draws as many diff lines as its body has rows for', async ($, on) => {
+    engineBeneath(on)
+    await $.tool.call(edit('/p/big.ts', lines('old', 40), lines('new', 40)))
+    await endTurn($, 't1')
+    const view = await sizedPane($, 56)
+    expect(await diffTexts(view)).toBe(30)
+    await view.redraw({ ...PANE_PROPS, bodyColumns: 100, scroll: { offset: 0, bodyRows: 20 } })
+    expect(await diffTexts(view)).toBe(10) // 20 - 9 chrome - the "more" row
+    expect(await view.find({ type: 'Text', text: /… \d+ more lines/ })).toBeDefined()
   })
 })

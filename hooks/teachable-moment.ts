@@ -28,9 +28,22 @@ const MAX_AGENT_TYPES = 50
 const MAX_SPAWNED = 50 // Teacher loop ids remembered
 const FALLBACK_TYPE = 'subagent'
 const MAX_TYPE_CHARS = 30
-const EXPLAIN_LINES = 6
-const PANE_ROWS = 30
-const PANE_COLUMNS = 72
+// Pane size. The pane is asked for as much room as the terminal has; the engine
+// caps `rows` at what the layout spares and the dock's `columns` at its ceiling.
+const PANE_MIN_COLUMNS = 72
+const PANE_MAX_COLUMNS = 120
+const PANE_DEFAULT_COLUMNS = 100 // terminal size not known yet
+const PANE_SIDE_MARGIN = 4
+const PANE_MIN_ROWS = 30
+const PANE_DEFAULT_ROWS = 60 // terminal size not known yet: ask for plenty, the layout caps it
+const PANE_BOTTOM_MARGIN = 2
+// Rows the view always draws around the diff and explanation: border (2), header,
+// step strip, file, meta (4), the diff's top margin (1), the buttons' margin and row (2).
+const CHROME_ROWS = 9
+const EXPLAIN_CHROME_ROWS = 2 // the explanation's top margin and its dim header
+const MAX_FREE_DIFF_LINES = 30 // diff lines when no explanation is shown
+const MIN_DIFF_LINES = 3
+const MIN_EXPLAIN_LINES = 3
 const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit'])
 
 const TEACHER_PROMPT = `You are the Teacher: you explain one code change, or one turn's set of related changes, to a junior developer.
@@ -134,6 +147,43 @@ function countChanges(diff: readonly DiffLine[]) {
   let add = 0, del = 0
   for (const l of diff) { if (l.op === '+') add++; else if (l.op === '-') del++ }
   return { add, del }
+}
+
+// The size to ask `$.ui.open` for: as wide as is useful, as tall as the terminal.
+export function paneSize(viewport: { columns: number; rows: number } | undefined): { rows: number; columns: number } {
+  if (!viewport) return { rows: PANE_DEFAULT_ROWS, columns: PANE_DEFAULT_COLUMNS }
+  return {
+    rows: Math.max(PANE_MIN_ROWS, viewport.rows - PANE_BOTTOM_MARGIN),
+    columns: Math.max(PANE_MIN_COLUMNS, Math.min(PANE_MAX_COLUMNS, viewport.columns - PANE_SIDE_MARGIN)),
+  }
+}
+
+export type Layout = { diffLines: number; explanationLines: number; needsScroll: boolean }
+
+// How a view of `budget` rows is shared between the diff and the explanation.
+// `explanationTotal` is the explanation's wrapped line count (undefined: none is
+// shown). With none, the diff takes what there is (up to MAX_FREE_DIFF_LINES). With
+// one, the diff keeps at most MAX_DIFF_LINES and shrinks (to MIN_DIFF_LINES) to
+// let the whole explanation fit; only when it still does not fit is it windowed
+// (`needsScroll`), the window being what the diff leaves less the scroll row.
+// A "… n more lines" row follows a cut diff, and an empty one is one row.
+export function layoutRows(budget: number, diffTotal: number, explanationTotal: number | undefined): Layout {
+  const avail = Math.max(0, budget - CHROME_ROWS)
+  const diffCost = (n: number) => Math.max(1, n) + (n < diffTotal ? 1 : 0)
+  if (explanationTotal === undefined) {
+    const free = Math.min(MAX_FREE_DIFF_LINES, avail)
+    const n = diffTotal <= free ? diffTotal : Math.max(MIN_DIFF_LINES, Math.min(MAX_FREE_DIFF_LINES, avail - 1))
+    return { diffLines: n, explanationLines: 0, needsScroll: false }
+  }
+  const room = avail - EXPLAIN_CHROME_ROWS
+  const smallest = Math.min(diffTotal, MIN_DIFF_LINES)
+  if (diffCost(smallest) + explanationTotal <= room) {
+    let n = Math.min(diffTotal, MAX_DIFF_LINES)
+    while (n > smallest && diffCost(n) + explanationTotal > room) n--
+    return { diffLines: n, explanationLines: explanationTotal, needsScroll: false }
+  }
+  // Scrolling: the window is what is left after the diff and the row for ▲ / ▼.
+  return { diffLines: smallest, explanationLines: Math.max(MIN_EXPLAIN_LINES, room - diffCost(smallest) - 1), needsScroll: true }
 }
 
 // Newest turn first; within a turn, the order the edits were made.
@@ -327,6 +377,7 @@ export type State = {
   currentId: number
   isOpen: boolean
   inBand: boolean
+  viewport: { columns: number; rows: number } | undefined // the terminal's size, as the last render saw it
   agentReady: Promise<undefined> | undefined // the Teacher's registration, shared by concurrent callers
   spawning: number
   explanations: Map<number, Explanation> // by step id
@@ -495,6 +546,14 @@ function stopAgent($: Engine, agentId: string) {
 
 // ---- Opening, closing, browsing ----
 
+// The terminal's size, kept from the renders so the pane can be opened to suit it.
+function rememberViewport(s: State, e: { viewport?: { columns: number; rows: number } }) {
+  const v = e.viewport
+  if (v && v.columns > 0 && v.rows > 0 && (v.columns !== s.viewport?.columns || v.rows !== s.viewport?.rows)) {
+    s.viewport = { columns: v.columns, rows: v.rows }
+  }
+}
+
 // 'empty': nothing recorded yet; 'failed': the pane could not be opened.
 async function openPane($: Engine, s: State): Promise<'opened' | 'empty' | 'failed'> {
   if (s.isOpen) return 'opened' // already open (or opening): keep the step being viewed
@@ -507,7 +566,7 @@ async function openPane($: Engine, s: State): Promise<'opened' | 'empty' | 'fail
     // band first (it held the keys if its button was pressed), then open.
     redraw($)
     await $.clock.sleep(200)
-    const placed = await $.ui.open({ id: PANE_ID, title: 'Teachable Moment', focus: true, closeOnEscape: true, rows: PANE_ROWS, columns: PANE_COLUMNS })
+    const placed = await $.ui.open({ id: PANE_ID, title: 'Teachable Moment', focus: true, closeOnEscape: true, ...paneSize(s.viewport) })
     // No room for a pane (a narrow terminal): draw it in the band instead.
     s.inBand = placed?.isPlaced === false
     redraw($)
@@ -545,10 +604,14 @@ function teachView($: Engine, s: State, e: DrawInput, isBand: boolean) {
   const exTurn = s.groupExplanations.get(step.turn)
   const ex = mode === 'turn' ? exTurn : exEdit
 
-  // In the band, share its rows between the diff and the explanation.
-  const spare = isBand ? Math.max(6, ('maxRows' in e.props ? e.props.maxRows : 20) - 10) : 99
-  const explainRows = ex ? (isBand ? Math.max(3, Math.min(EXPLAIN_LINES, Math.floor(spare / 3))) : EXPLAIN_LINES) : 0
-  const maxDiff = isBand ? Math.max(3, Math.min(MAX_DIFF_LINES, spare - explainRows - 3)) : MAX_DIFF_LINES
+  // The rows this view may take (the pane's body, or the band's `maxRows`),
+  // shared between the diff and the explanation.
+  const budget = isBand
+    ? ('maxRows' in e.props ? e.props.maxRows : 20)
+    : e.props.scroll?.bodyRows || (e.viewport?.rows ? e.viewport.rows - PANE_BOTTOM_MARGIN : PANE_MIN_ROWS)
+  const exLines = ex ? explanationLines(ex, width) : undefined
+  const layout = layoutRows(budget, step.diff.length, exLines?.length)
+  const maxDiff = layout.diffLines
 
   const shown = step.diff.slice(0, maxDiff)
   const diffRows = shown.map((l, n) => {
@@ -601,7 +664,7 @@ function teachView($: Engine, s: State, e: DrawInput, isBand: boolean) {
         Text({ color: 'red', children: `-${del}` }),
       ] }),
       Box({ key: 'diff', flexDirection: 'column', marginTop: 1, children: diffRows }),
-      ...(ex ? [explanationBox($, s, e, ex, header, saveEx, width, explainRows)] : []),
+      ...(ex ? [explanationBox($, s, e, ex, exLines ?? [], header, saveEx, layout.explanationLines)] : []),
       Box({ key: 'buttons', flexDirection: 'row', gap: 2, marginTop: 1, children: [
         Button({ key: 'prev', label: '◀ Prev', hotkey: 'p', onPress: () => go(k - 1) }),
         Button({ key: 'next', label: 'Next ▶', hotkey: 'n', autoFocus: true, onPress: () => go(k + 1) }),
@@ -613,9 +676,23 @@ function teachView($: Engine, s: State, e: DrawInput, isBand: boolean) {
   })
 }
 
+type ExLine = { text: string; bold?: boolean }
+
+// The explanation as drawn lines: a done one is its High/Low level text wrapped
+// to `width`; loading is one line and an error its wrapped message.
+function explanationLines(ex: Explanation, width: number): ExLine[] {
+  if (ex.status === 'loading') return [{ text: '' }]
+  if (ex.status === 'error') return wrapText(`Teacher couldn't explain this: ${ex.reason}`, width).map((text) => ({ text }))
+  const lines: ExLine[] = []
+  if (ex.high) lines.push({ text: 'High level', bold: true }, ...wrapText(ex.high, width).map((text) => ({ text })))
+  if (ex.low) lines.push({ text: 'Low level', bold: true }, ...wrapText(ex.low, width).map((text) => ({ text })))
+  return lines
+}
+
 // The explanation area: a dim header, then loading, error, or the (scrollable)
-// High/Low level text. `save` stores the explanation back (a new scroll offset).
-function explanationBox($: Engine, s: State, e: DrawInput, ex: Explanation, header: string, save: (ex: Explanation) => void, width: number, room: number) {
+// High/Low level text, `room` lines of it at a time. `save` stores the
+// explanation back (a new scroll offset).
+function explanationBox($: Engine, s: State, e: DrawInput, ex: Explanation, lines: readonly ExLine[], header: string, save: (ex: Explanation) => void, room: number) {
   const { Box, Text, Button } = $.ui.resolve(e)
   const head = Text({ dimColor: true, children: header })
   if (ex.status === 'loading') {
@@ -629,9 +706,6 @@ function explanationBox($: Engine, s: State, e: DrawInput, ex: Explanation, head
       head, Text({ color: 'red', wrap: 'wrap', children: `Teacher couldn't explain this: ${ex.reason}` }),
     ] })
   }
-  const lines: Array<{ text: string; bold?: boolean }> = []
-  if (ex.high) lines.push({ text: 'High level', bold: true }, ...wrapText(ex.high, width).map((text) => ({ text })))
-  if (ex.low) lines.push({ text: 'Low level', bold: true }, ...wrapText(ex.low, width).map((text) => ({ text })))
   const maxOffset = Math.max(0, lines.length - room)
   const offset = Math.max(0, Math.min(ex.scroll, maxOffset))
   const scrollTo = (to: number) => {
@@ -659,7 +733,7 @@ export const register: Register = (on, options) => {
     model: typeof configured === 'string' && configured.trim() ? configured.trim() : DEFAULT_MODEL,
     isActive: true, mode: 'edit', pending: [], pendingSub: new Map(), spawned: new Set(), agentTypes: new Map(),
     steps: [], turns: 0, nextId: 1, currentId: 0,
-    isOpen: false, inBand: false, agentReady: undefined, spawning: 0,
+    isOpen: false, inBand: false, viewport: undefined, agentReady: undefined, spawning: 0,
     explanations: new Map(), groupExplanations: new Map(), waiting: new Map(), early: new Map(),
   }
 
@@ -742,6 +816,7 @@ export const register: Register = (on, options) => {
   // Ours goes first and whatever the other plugins (and the engine) draw
   // below it stays, so Replay Theater's band is not hidden.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    rememberViewport(s, e)
     const { Box, Text, Button } = $.ui.resolve(e)
     const n = s.steps.length
     const ours = s.isOpen && s.inBand
@@ -763,6 +838,7 @@ export const register: Register = (on, options) => {
   // The pane.
   on('ui.render', { component: 'Pane' }, ($, e, next) => {
     if (e.requestId !== PANE_ID) return next(e)
+    rememberViewport(s, e)
     return teachView($, s, e, false)
   })
 
