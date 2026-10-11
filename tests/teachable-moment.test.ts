@@ -527,3 +527,14 @@ describe('Teacher notifications', () => {
     expect(isOurNotification(s, { kind: 'user' }, 'mention teacher-1 in a prompt')).toBe(false)
   })
 })
+
+describe("the Teacher's hand-back message", () => {
+  test('a delivery stamped with this plugin is consumed; others pass', async ($, on) => {
+    engineBeneath(on)
+    on('session.receive', (_$, e) => ({ text: e.text }))
+    const ours = await $.session.receive({ origin: { kind: 'peer', teammate: 'teacher', isVerified: true, plugin: PLUGIN }, text: 'HIGH LEVEL: ...' } as never)
+    expect(ours).toEqual({ consumed: expect.any(String) })
+    const other = await $.session.receive({ origin: { kind: 'peer', teammate: 'worker', isVerified: true }, text: 'report' } as never)
+    expect(other).toEqual({ text: 'report' })
+  })
+})

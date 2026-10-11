@@ -12,7 +12,8 @@
 import type { EngineInterface, Register, RenderInput } from 'claude-code'
 
 const PANE_ID = 'teachable-moment'
-const AGENT_TYPE = 'teachable-moment:teacher'
+const PLUGIN_NAME = 'teachable-moment'
+const AGENT_TYPE = `${PLUGIN_NAME}:teacher`
 const DEFAULT_MODEL = 'claude-sonnet-5-5'
 const MAX_STEPS = 200
 const MAX_DIFF_LINES = 12
@@ -752,6 +753,18 @@ export const register: Register = (on, options) => {
   // notification to the main conversation when it ends. Drop ours.
   on('prompt.submit', ($, e, next) =>
     isOurNotification(s, e.origin, e.text) ? { drop: 'Teachable Moment: Teacher finished (shown in the pane)' } : next(e))
+
+  // A background agent also hands its final answer back to the main
+  // conversation as a message ("Message from teachable-moment:teacher").
+  // The pane reads the answer from turn.complete, so stop the message at both
+  // ends: as our Teacher sends it, and as the main conversation receives one
+  // the engine stamped with this plugin's name (agents it spawned carry it).
+  on('session.send', ($, e, next) =>
+    e.agentId && isOurs(s, e.agentId) ? { isDelivered: true } : next(e))
+  on('session.receive', ($, e, next) =>
+    !e.agentId && 'plugin' in e.origin && e.origin.plugin === PLUGIN_NAME
+      ? { consumed: 'Teacher answer shown in the Teachable Moment pane' }
+      : next(e))
 
   on('session.start', async ($, e, next) => {
     const r = await next(e)
