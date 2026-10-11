@@ -464,7 +464,7 @@ async function explain($: Engine, s: State, target: Target) {
   try {
     await ensureAgent($, s)
     const started = await $.agent.spawn({
-      subagentType: AGENT_TYPE, prompt, description: target.kind === 'edit' ? 'Explain an edit' : 'Explain a turn', model: s.model,
+      subagentType: AGENT_TYPE, prompt, description: target.kind === 'edit' ? 'Explain an edit' : 'Explain a turn',
     })
     const agentId = started.agentId
     if (started.deny !== undefined || !agentId) return fail($, s, target, shortReason(started.deny ?? 'it did not start'))
