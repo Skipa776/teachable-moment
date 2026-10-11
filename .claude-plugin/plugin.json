@@ -1,6 +1,6 @@
 {
   "name": "teachable-moment",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Step through the edits Claude made this session and ask a Teacher subagent to explain any of them.",
   "author": {
     "name": "Skipa776"

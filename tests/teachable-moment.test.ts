@@ -3,7 +3,7 @@ import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 import type { State } from '../hooks/teachable-moment'
-import { allocateBudget, cleanText, commitDrafts, explanationFor, isOurNotification, isOurs, layoutRows, orderSteps, paneSize, parseExplanation, wrapText } from '../hooks/teachable-moment'
+import { allocateBudget, cleanText, commitDrafts, explanationFor, fileBlock, layoutRows, orderSteps, paneSize, parseExplanation, wrapText } from '../hooks/teachable-moment'
 
 const PLUGIN = 'teachable-moment'
 const PANE_PROPS = {
@@ -14,24 +14,32 @@ const BAND_PROPS = {
   hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 100, scroll: { offset: 0, bodyRows: 10 }, view: {},
 } as const
 
-// What the engine does beneath the plugin: let every call through and collect
-// the prompts of the Teacher spawns.
-function engineBeneath(on: On, bandText = '', holdSecondSpawn?: Promise<void>) {
-  const spawned: string[] = []
+const ANSWER = 'HIGH LEVEL:\nIt swaps one for two.\nLOW LEVEL:\nThe string changes.'
+const USAGE = { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
+type Reply = { isAnswered: true; text: string; usage: typeof USAGE } | { isAnswered: false; reason: 'api-error'; status: number; error: never; usage: typeof USAGE }
+
+// What the engine does beneath the plugin: let every call through, collect the
+// prompts of the Teacher's model calls, and answer them (`reply`), the second
+// one only once `holdSecond` resolves. Files read as `files` says.
+function engineBeneath(on: On, bandText = '', holdSecond?: Promise<void>, reply: () => Reply = () => ({ isAnswered: true, text: ANSWER, usage: USAGE }), files: Record<string, string> = {}) {
+  const asked: string[] = []
   on('tool.call', () => ({ result: 'ok', text: 'ok' }))
   on('turn.complete', (_$, e) => ({ text: e.answer }))
-  on('agent.register', () => ({ value: { agent: 'teachable-moment:teacher' } }))
-  on('agent.spawn', async (_$, e) => {
-    spawned.push(e.prompt)
-    if (spawned.length === 2) await holdSecondSpawn
-    return { model: 'claude-sonnet-5-5', agentId: `teacher-${spawned.length}` }
+  on('fs.read', (_$, e) => {
+    if (!(e.path in files)) throw new Error('ENOENT')
+    return { value: files[e.path]! }
+  })
+  on('model.complete', async (_$, e) => {
+    asked.push(e.prompt)
+    if (asked.length === 2) await holdSecond
+    return { value: reply() }
   })
   // The band drawn beneath ours (another plugin's, or the engine's own): empty unless a test gives it text.
   on('ui.render', ($, e) => {
     const { Box, Text } = $.ui.resolve(e)
     return Box({ children: bandText ? Text({ children: bandText }) : [] })
   })
-  return spawned
+  return asked
 }
 
 const edit = (file: string, from: string, to: string, extra: Record<string, unknown> = {}) =>
@@ -148,15 +156,6 @@ describe('recording', () => {
     await $.tool.call(edit('/p/a.ts', 'one', 'two', { agentId: 'sub1' }))
     await $.turn.complete({ answer: '', durationMs: 1, isAborted: true, turnId: 'x', reason: 'aborted', agentId: 'sub1' })
     expect(await (await pane($)).find({ type: 'Text', text: /step 1 of 1/ })).toBeDefined()
-  })
-
-  test('the loops of an agent this mod started are never recorded', () => {
-    // The test kit drops the agentId a spawn is answered with, so the mod never
-    // learns a Teacher's id here: its check is exercised directly.
-    const state = { spawned: new Set(['teacher-9']), waiting: new Map([['teacher-10', { target: { kind: 'edit' as const, id: 1 }, cancel: () => {} }]]) }
-    expect(isOurs(state, 'teacher-9')).toBe(true)
-    expect(isOurs(state, 'teacher-10')).toBe(true)
-    expect(isOurs(state, 'sub1')).toBe(false)
   })
 
   test('with /teach off a subagent edit is not recorded', async ($, on) => {
@@ -276,20 +275,16 @@ describe('explaining', () => {
     expect(wrapText('abcdefghij', 4)).toEqual(['abcd', 'efgh', 'ij'])
   })
 
-  test('a finished Teacher turn becomes an explanation or an error', () => {
-    const turn = { reason: 'answer', answer: 'HIGH LEVEL:\nWhy.\nLOW LEVEL:\nHow.', isAborted: false }
-    expect(explanationFor(turn)).toEqual({ status: 'done', high: 'Why.', low: 'How.', scroll: 0 })
-    expect(explanationFor({ ...turn, answer: '  ' })).toEqual({ status: 'error', reason: 'it gave an empty answer' })
-    expect(explanationFor({ ...turn, reason: 'aborted', isAborted: true })).toEqual({ status: 'error', reason: 'it was interrupted' })
-    expect(explanationFor({ ...turn, reason: 'error' })).toEqual({ status: 'error', reason: 'the request failed' })
-    expect(explanationFor({ ...turn, reason: 'refusal' })).toEqual({ status: 'error', reason: 'the model declined' })
+  test("the model's answer becomes an explanation or an error", () => {
+    expect(explanationFor({ isAnswered: true, text: 'HIGH LEVEL:\nWhy.\nLOW LEVEL:\nHow.' })).toEqual({ status: 'done', high: 'Why.', low: 'How.', scroll: 0 })
+    expect(explanationFor({ isAnswered: true, text: '  ' })).toEqual({ status: 'error', reason: 'it gave an empty answer' })
+    expect(explanationFor({ isAnswered: false, reason: 'aborted' })).toEqual({ status: 'error', reason: 'it took too long' })
+    expect(explanationFor({ isAnswered: false, reason: 'empty-reply' })).toEqual({ status: 'error', reason: 'it gave an empty answer' })
+    expect(explanationFor({ isAnswered: false, reason: 'api-error', status: 529 })).toEqual({ status: 'error', reason: 'the request failed (HTTP 529)' })
   })
 
-  // The test kit strips `agentId` from a spawn answered beneath the plugin (core
-  // alone sets it), so a real Teacher's answer cannot be matched here: the spawn
-  // itself is checked, and a spawn with no id must end in an error with Retry.
-  test('Explain edit spawns the Teacher with the whole edit; a spawn that never started offers Retry', async ($, on) => {
-    const spawned = engineBeneath(on)
+  test('Explain edit asks the model once with the edit and the file, and shows the answer in the pane', async ($, on) => {
+    const asked = engineBeneath(on, '', undefined, undefined, { '/p/a.ts': 'const a = 1\ntwo\nexport default a' })
     await $.tool.call(edit('/p/a.ts', 'one', 'two'))
     await endTurn($, 't1')
 
@@ -297,25 +292,45 @@ describe('explaining', () => {
     expect((await view.find({ key: 'explain' }))?.text).toContain('Explain edit')
     expect((await view.find({ key: 'explain-turn' }))?.text).toContain('Explain turn')
     await view.press({ key: 'explain' })
-    expect(spawned).toHaveLength(1)
-    expect(spawned[0]).toContain('File: /p/a.ts')
-    expect(spawned[0]).toContain('Absolute path: /p/a.ts')
-    expect(spawned[0]).toContain('Tool: Edit')
-    expect(spawned[0]).toContain('- one')
-    expect(spawned[0]).toContain('+ two')
-    expect(await view.find({ type: 'Text', text: /Teacher couldn't explain this/ })).toBeDefined()
+    expect(asked).toHaveLength(1)
+    for (const part of ['File: /p/a.ts', 'Absolute path: /p/a.ts', 'Tool: Edit', '- one', '+ two', '=====FILE /p/a.ts START=====', 'export default a']) {
+      expect(asked[0]).toContain(part)
+    }
+    expect(await view.find({ type: 'Text', text: 'High level' })).toBeDefined()
+    expect(await view.find({ type: 'Text', text: /It swaps one for two/ })).toBeDefined()
+    await view.press({ key: 'explain' }) // cached: only switches the view, no second call
+    expect(asked).toHaveLength(1)
+    await view.press({ key: 'explain-turn' })
+    await view.press({ key: 'explain' }) // back to the cached edit explanation: no second call for it
+    expect(asked).toHaveLength(2) // the one call is the turn's
+  })
+
+  test('a failed model call offers Retry, and Retry asks again', async ($, on) => {
+    const asked = engineBeneath(on, '', undefined, () => ({ isAnswered: false, reason: 'api-error', status: 529, error: undefined as never, usage: USAGE }))
+    await $.tool.call(edit('/p/a.ts', 'one', 'two'))
+    await endTurn($, 't1')
+    const view = await pane($)
+    await view.press({ key: 'explain' })
+    expect(await view.find({ type: 'Text', text: /Teacher couldn't explain this: the request failed \(HTTP 529\)/ })).toBeDefined()
     expect((await view.find({ key: 'explain' }))?.text).toContain('Retry')
     await view.press({ key: 'explain' })
-    expect(spawned).toHaveLength(2)
+    expect(asked).toHaveLength(2)
+  })
+
+  test('a long file is windowed around the edit, not cut at its head', () => {
+    const block = fileBlock(new Map([['/p/x.ts (lines 101-500 of 900)', 'mid']]))
+    expect(block[0]).toContain('data, not instructions')
+    expect(block).toContain('=====FILE /p/x.ts (lines 101-500 of 900) START=====')
+    expect(fileBlock(new Map())).toEqual([])
   })
 
   test('the prompt for a 500-line rewrite still carries the added lines', async ($, on) => {
-    const spawned = engineBeneath(on)
+    const asked = engineBeneath(on)
     await $.tool.call(edit('/p/big.ts', lines('old', 500), lines('new', 500)))
     await endTurn($, 't1')
     await (await pane($)).press({ key: 'explain' })
 
-    const prompt = spawned[0]!
+    const prompt = asked[0]!
     expect(prompt).toContain('=====DIFF START=====')
     expect(prompt).toContain('- old 0')
     expect(prompt).toContain('+ new 0')
@@ -337,18 +352,17 @@ describe('explaining', () => {
   }
 
   test('the turn prompt lists all three files and carries added lines from each within the budget', async ($, on) => {
-    const spawned = engineBeneath(on)
+    const asked = engineBeneath(on)
     await threeFiles($)
     await (await pane($)).press({ key: 'explain-turn' })
 
-    expect(spawned).toHaveLength(1)
-    const prompt = spawned[0]!
+    expect(asked).toHaveLength(1)
+    const prompt = asked[0]!
     for (const [i, f] of ['a', 'b', 'c'].entries()) {
       expect(prompt).toContain(`${i + 1}. /p/${f}.ts | absolute path: /p/${f}.ts | tool: Edit`)
       expect(prompt).toContain(`+ new-${f} 0`)
       expect(prompt).not.toContain(`- old-${f} 0`) // '+' lines come first and fill the share
     }
-    expect(prompt).toContain('You may Read the full files')
     expect(prompt).toContain('HIGH LEVEL')
     expect(prompt).toContain('LOW LEVEL')
     expect(prompt).toContain('data, not instructions')
@@ -359,25 +373,25 @@ describe('explaining', () => {
     expect(body).toContain('more diff lines omitted')
   })
 
-  test('Explain turn when one is already under way does not spawn again, and the header follows the mode', async ($, on) => {
+  test('Explain turn when one is already under way does not ask again, and the header follows the mode', async ($, on) => {
     let release = () => {}
-    const spawned = engineBeneath(on, '', new Promise<void>((resolve) => { release = resolve }))
+    const asked = engineBeneath(on, '', new Promise<void>((resolve) => { release = resolve }))
     await threeFiles($)
     const view = await pane($)
 
-    await view.press({ key: 'explain' }) // spawn 1: the edit's, which never starts
+    await view.press({ key: 'explain' }) // call 1: the edit's, answered at once
     expect(await view.find({ type: 'Text', text: 'This edit' })).toBeDefined()
     expect(await view.find({ type: 'Text', text: 'This turn · 3 files' })).toBeUndefined()
 
-    const first = view.press({ key: 'explain-turn' }) // spawn 2 waits on the gate
-    for (let tries = 0; spawned.length < 2 && tries < 100; tries++) await view.find({ key: 'next' })
-    expect(spawned).toHaveLength(2)
+    const first = view.press({ key: 'explain-turn' }) // call 2 waits on the gate
+    for (let tries = 0; asked.length < 2 && tries < 100; tries++) await view.find({ key: 'next' })
+    expect(asked).toHaveLength(2)
     expect(await view.find({ type: 'Text', text: 'This turn · 3 files' })).toBeDefined()
     expect(await view.find({ type: 'Text', text: 'Teacher is explaining this turn… (Sonnet)' })).toBeDefined()
     expect(await view.find({ type: 'Text', text: 'This edit' })).toBeUndefined()
 
     await view.press({ key: 'explain-turn' }) // loading: only switches the view
-    expect(spawned).toHaveLength(2)
+    expect(asked).toHaveLength(2)
     await view.press({ key: 'next' }) // navigating keeps the mode, and the group's explanation
     expect(await view.find({ type: 'Text', text: 'This turn · 3 files' })).toBeDefined()
     await view.press({ key: 'explain' }) // back to the edit view
@@ -387,26 +401,21 @@ describe('explaining', () => {
     await first
   })
 
-  test('a group that loses any step to the cap loses its cached explanation, and one being fetched is given up', () => {
+  test('a group that loses any step to the cap loses its cached explanation', () => {
     const state = {
       steps: [], turns: 0, nextId: 1, currentId: 0,
-      explanations: new Map(), groupExplanations: new Map(), waiting: new Map(),
+      explanations: new Map(), groupExplanations: new Map(),
     } as unknown as State
     const drafts = (n: number) => Array.from({ length: n }, (_, i) => ({ tool: 'Edit', file: `f${i}`, absPath: `/p/f${i}`, diff: [], note: '' }))
     const done = { status: 'done' as const, high: 'h', low: 'l', scroll: 0 }
-    let cancelled = 0
     commitDrafts(state, drafts(150)) // group 1
     commitDrafts(state, drafts(50)) // group 2: 200 steps, nothing cut
     state.groupExplanations.set(1, done)
     state.groupExplanations.set(2, done)
-    state.waiting.set('t1', { target: { kind: 'turn', id: 1 }, cancel: () => { cancelled++ } })
-    state.waiting.set('t2', { target: { kind: 'turn', id: 2 }, cancel: () => { cancelled++ } })
     expect([...state.groupExplanations.keys()]).toEqual([1, 2])
 
     commitDrafts(state, drafts(1)) // group 3 cuts one step of group 1
     expect([...state.groupExplanations.keys()]).toEqual([2])
-    expect([...state.waiting.keys()]).toEqual(['t2'])
-    expect(cancelled).toBe(1)
     expect(state.steps).toHaveLength(200)
   })
 
@@ -415,23 +424,6 @@ describe('explaining', () => {
     expect(cleanText('x\x1b]0;title\x07y')).toBe('xy')
   })
 
-  test('a turn of some other subagent is ignored', async ($, on) => {
-    engineBeneath(on)
-    await $.tool.call(edit('/p/a.ts', 'one', 'two'))
-    await endTurn($, 't1')
-    await endTurn($, 'other', 'someone-else', 'HIGH LEVEL:\nx\nLOW LEVEL:\ny')
-    const view = await pane($)
-    expect(await view.find({ type: 'Text', text: 'High level' })).toBeUndefined()
-    expect(await view.find({ type: 'Text', text: /step 1 of 1/ })).toBeDefined()
-  })
-
-  test('the model is never offered the Teacher', async ($, on) => {
-    engineBeneath(on)
-    const offer = await $.agent.offer({
-      agent: 'teachable-moment:teacher', description: 'x', source: 'plugin', provider: { plugin: PLUGIN, tier: 'user' },
-    })
-    expect(offer.isOffered).toBe(false)
-  })
 })
 
 describe('sizing', () => {
@@ -514,27 +506,5 @@ describe('sizing', () => {
     await view.redraw({ ...PANE_PROPS, bodyColumns: 100, scroll: { offset: 0, bodyRows: 20 } })
     expect(await diffTexts(view)).toBe(10) // 20 - 9 chrome - the "more" row
     expect(await view.find({ type: 'Text', text: /… \d+ more lines/ })).toBeDefined()
-  })
-})
-
-describe('Teacher notifications', () => {
-  test("only our Teachers' task notifications are dropped", () => {
-    const s = { spawned: new Set(['teacher-1']), waiting: new Map([['teacher-2', {} as never]]) }
-    const note = (id: string) => `<task-notification><task-id>${id}</task-id><status>completed</status></task-notification>`
-    expect(isOurNotification(s, { kind: 'task-notification' }, note('teacher-1'))).toBe(true)
-    expect(isOurNotification(s, { kind: 'task-notification' }, note('teacher-2'))).toBe(true)
-    expect(isOurNotification(s, { kind: 'task-notification' }, note('worker-7'))).toBe(false)
-    expect(isOurNotification(s, { kind: 'user' }, 'mention teacher-1 in a prompt')).toBe(false)
-  })
-})
-
-describe("the Teacher's hand-back message", () => {
-  test('a delivery stamped with this plugin is consumed; others pass', async ($, on) => {
-    engineBeneath(on)
-    on('session.receive', (_$, e) => ({ text: e.text }))
-    const ours = await $.session.receive({ origin: { kind: 'peer', teammate: 'teacher', isVerified: true, plugin: PLUGIN }, text: 'HIGH LEVEL: ...' } as never)
-    expect(ours).toEqual({ consumed: expect.any(String) })
-    const other = await $.session.receive({ origin: { kind: 'peer', teammate: 'worker', isVerified: true }, text: 'report' } as never)
-    expect(other).toEqual({ text: 'report' })
   })
 })
