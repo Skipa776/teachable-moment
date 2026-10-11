@@ -2,7 +2,7 @@ import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { cleanText, explanationFor, orderSteps, parseExplanation, wrapText } from '../hooks/teachable-moment'
+import { allocateBudget, cleanText, explanationFor, isOurs, orderSteps, parseExplanation, wrapText } from '../hooks/teachable-moment'
 
 const PLUGIN = 'teachable-moment'
 const PANE_PROPS = {
@@ -15,13 +15,14 @@ const BAND_PROPS = {
 
 // What the engine does beneath the plugin: let every call through and collect
 // the prompts of the Teacher spawns.
-function engineBeneath(on: On, bandText = '') {
+function engineBeneath(on: On, bandText = '', holdSecondSpawn?: Promise<void>) {
   const spawned: string[] = []
   on('tool.call', () => ({ result: 'ok', text: 'ok' }))
   on('turn.complete', (_$, e) => ({ text: e.answer }))
   on('agent.register', () => ({ value: { agent: 'teachable-moment:teacher' } }))
-  on('agent.spawn', (_$, e) => {
+  on('agent.spawn', async (_$, e) => {
     spawned.push(e.prompt)
+    if (spawned.length === 2) await holdSecondSpawn
     return { model: 'claude-sonnet-5-5', agentId: `teacher-${spawned.length}` }
   })
   // The band drawn beneath ours (another plugin's, or the engine's own): empty unless a test gives it text.
@@ -37,6 +38,13 @@ const edit = (file: string, from: string, to: string, extra: Record<string, unkn
 
 const endTurn = ($: Engine, turnId: string, agentId?: string, answer = '') =>
   $.turn.complete({ answer, durationMs: 1, isAborted: false, turnId, reason: 'answer', ...(agentId ? { agentId } : {}) })
+
+// The agents the engine would list: `$.agent.list()` reads them from this hook.
+const listAgents = (on: On, agents: Array<{ id: string; type: string }>) =>
+  on('agent.list', () => ({ value: agents.map((a) => ({ ...a, description: 'd', status: 'running' })) }) as never)
+
+// A rewrite of `count` lines of `word`, as the edit's old and new text.
+const lines = (word: string, count: number) => Array.from({ length: count }, (_, i) => `${word} ${i}`).join('\n')
 
 const pane = ($: Engine) => $.ui.mount({ plugin: PLUGIN, surface: 'terminal', component: 'Pane', requestId: PLUGIN, props: PANE_PROPS })
 const teach = ($: Engine, args = '') => $.command.run({ command: 'teach', args } as never) // the test's `$` also asks for origin and presentation, which the engine stamps
@@ -72,11 +80,83 @@ describe('recording', () => {
     expect(await band.find({ type: 'Text', text: 'replay band below' })).toBeDefined()
   })
 
-  test('an edit made inside a subagent is not recorded', async ($, on) => {
+  test('a subagent edit is recorded in its own group when that subagent\'s turn completes, labelled with its type', async ($, on) => {
+    engineBeneath(on)
+    listAgents(on, [{ id: 'sub1', type: 'savvy-careful' }])
+    await $.tool.call(edit('/p/a.ts', 'one', 'two', { agentId: 'sub1' }))
+    await endTurn($, 'sub-turn', 'sub1')
+    const view = await pane($)
+    expect(await view.find({ type: 'Text', text: 'turn 1 · savvy-careful · step 1 of 1' })).toBeDefined()
+    expect(await view.find({ type: 'Text', text: '/p/a.ts' })).toBeDefined()
+  })
+
+  test('a subagent that the agent list does not know is labelled "subagent"', async ($, on) => {
     engineBeneath(on)
     await $.tool.call(edit('/p/a.ts', 'one', 'two', { agentId: 'sub1' }))
     await endTurn($, 'sub-turn', 'sub1')
+    expect(await (await pane($)).find({ type: 'Text', text: 'turn 1 · subagent · step 1 of 1' })).toBeDefined()
+  })
+
+  test('a subagent turn commits only its own edits, the main turn only the main ones', async ($, on) => {
+    engineBeneath(on)
+    listAgents(on, [{ id: 'sub1', type: 'Explore' }, { id: 'sub2', type: 'reviewer' }])
+    const band = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', component: 'AbovePrompt', props: BAND_PROPS })
+    const recorded = (n: number) => band.find({ type: 'Text', text: new RegExp(`Teachable Moment: ${n} edit`) })
+
+    await $.tool.call(edit('/p/main.ts', 'a', 'b'))
+    await $.tool.call(edit('/p/sub1.ts', 'a', 'b', { agentId: 'sub1' }))
+    await $.tool.call(edit('/p/sub2.ts', 'a', 'b', { agentId: 'sub2' }))
+    expect(await recorded(1)).toBeUndefined() // nothing committed yet
+
+    await endTurn($, 'main-turn')
+    expect(await recorded(1)).toBeDefined() // only the main loop's edit
+    await endTurn($, 'sub1-turn', 'sub1')
+    expect(await recorded(2)).toBeDefined()
+    await endTurn($, 'sub1-again', 'sub1') // nothing left pending: no empty group
+    expect(await recorded(2)).toBeDefined()
+    await endTurn($, 'sub2-turn', 'sub2')
+    expect(await recorded(3)).toBeDefined()
+
+    const view = await pane($) // newest group first
+    expect(await view.find({ type: 'Text', text: 'turn 3 · reviewer · step 1 of 3' })).toBeDefined()
+    expect(await view.find({ type: 'Text', text: '/p/sub2.ts' })).toBeDefined()
+    await view.press({ key: 'next' })
+    expect(await view.find({ type: 'Text', text: 'turn 2 · Explore · step 2 of 3' })).toBeDefined()
+    await view.press({ key: 'next' })
+    expect(await view.find({ type: 'Text', text: 'turn 1 · step 3 of 3' })).toBeDefined()
+    expect(await view.find({ type: 'Text', text: '/p/main.ts' })).toBeDefined()
+  })
+
+  test('a subagent turn that was aborted still commits what it edited', async ($, on) => {
+    engineBeneath(on)
+    await $.tool.call(edit('/p/a.ts', 'one', 'two', { agentId: 'sub1' }))
+    await $.turn.complete({ answer: '', durationMs: 1, isAborted: true, turnId: 'x', reason: 'aborted', agentId: 'sub1' })
+    expect(await (await pane($)).find({ type: 'Text', text: /step 1 of 1/ })).toBeDefined()
+  })
+
+  test('the loops of an agent this mod started are never recorded', () => {
+    // The test kit drops the agentId a spawn is answered with, so the mod never
+    // learns a Teacher's id here: its check is exercised directly.
+    const state = { spawned: new Set(['teacher-9']), waiting: new Map([['teacher-10', { target: { kind: 'edit' as const, id: 1 }, cancel: () => {} }]]) }
+    expect(isOurs(state, 'teacher-9')).toBe(true)
+    expect(isOurs(state, 'teacher-10')).toBe(true)
+    expect(isOurs(state, 'sub1')).toBe(false)
+  })
+
+  test('with /teach off a subagent edit is not recorded', async ($, on) => {
+    engineBeneath(on)
+    await teach($, 'off')
+    await $.tool.call(edit('/p/a.ts', 'one', 'two', { agentId: 'sub1' }))
+    await endTurn($, 'sub-turn', 'sub1')
     await endTurn($, 't1')
+    expect((await teach($)).text).toBe('Teachable Moment: no edits recorded yet.')
+  })
+
+  test('a failed subagent edit is not recorded', async ($, on) => {
+    on('tool.call', () => ({ deny: 'nope' }))
+    on('turn.complete', (_$, e) => ({ text: e.answer }))
+    await $.tool.call(edit('/p/a.ts', 'one', 'two', { agentId: 'sub1' }))
+    await endTurn($, 'sub-turn', 'sub1')
     expect((await teach($)).text).toBe('Teachable Moment: no edits recorded yet.')
   })
 
@@ -192,13 +272,14 @@ describe('explaining', () => {
   // The test kit strips `agentId` from a spawn answered beneath the plugin (core
   // alone sets it), so a real Teacher's answer cannot be matched here: the spawn
   // itself is checked, and a spawn with no id must end in an error with Retry.
-  test('Explain this spawns the Teacher with the whole edit; a spawn that never started offers Retry', async ($, on) => {
+  test('Explain edit spawns the Teacher with the whole edit; a spawn that never started offers Retry', async ($, on) => {
     const spawned = engineBeneath(on)
     await $.tool.call(edit('/p/a.ts', 'one', 'two'))
     await endTurn($, 't1')
 
     const view = await pane($)
-    expect(await view.find({ key: 'explain' })).toBeDefined()
+    expect((await view.find({ key: 'explain' }))?.text).toContain('Explain edit')
+    expect((await view.find({ key: 'explain-turn' }))?.text).toContain('Explain turn')
     await view.press({ key: 'explain' })
     expect(spawned).toHaveLength(1)
     expect(spawned[0]).toContain('File: /p/a.ts')
@@ -214,8 +295,7 @@ describe('explaining', () => {
 
   test('the prompt for a 500-line rewrite still carries the added lines', async ($, on) => {
     const spawned = engineBeneath(on)
-    const lines = (word: string) => Array.from({ length: 500 }, (_, i) => `${word} ${i}`).join('\n')
-    await $.tool.call(edit('/p/big.ts', lines('old'), lines('new')))
+    await $.tool.call(edit('/p/big.ts', lines('old', 500), lines('new', 500)))
     await endTurn($, 't1')
     await (await pane($)).press({ key: 'explain' })
 
@@ -226,6 +306,69 @@ describe('explaining', () => {
     expect(prompt).toContain('+ new 149')
     expect(prompt).not.toContain('+ new 150')
     expect(prompt).toContain('350 more added lines not kept')
+  })
+
+  test('splits the turn diff budget fairly, small steps keeping all they have', () => {
+    expect(allocateBudget([5, 1000, 1000])).toEqual([5, 197, 198])
+    expect(allocateBudget([1000, 1000, 1000]).reduce((a, b) => a + b)).toBeLessThanOrEqual(400)
+    expect(allocateBudget([3, 4])).toEqual([3, 4])
+    expect(Math.min(...allocateBudget(Array(10).fill(1000)))).toBeGreaterThanOrEqual(20)
+  })
+
+  const threeFiles = async ($: Engine) => {
+    for (const f of ['a', 'b', 'c']) await $.tool.call(edit(`/p/${f}.ts`, lines(`old-${f}`, 300), lines(`new-${f}`, 300)))
+    await endTurn($, 't1')
+  }
+
+  test('the turn prompt lists all three files and carries added lines from each within the budget', async ($, on) => {
+    const spawned = engineBeneath(on)
+    await threeFiles($)
+    await (await pane($)).press({ key: 'explain-turn' })
+
+    expect(spawned).toHaveLength(1)
+    const prompt = spawned[0]!
+    for (const [i, f] of ['a', 'b', 'c'].entries()) {
+      expect(prompt).toContain(`${i + 1}. /p/${f}.ts | absolute path: /p/${f}.ts | tool: Edit`)
+      expect(prompt).toContain(`+ new-${f} 0`)
+      expect(prompt).not.toContain(`- old-${f} 0`) // '+' lines come first and fill the share
+    }
+    expect(prompt).toContain('You may Read the full files')
+    expect(prompt).toContain('HIGH LEVEL')
+    expect(prompt).toContain('LOW LEVEL')
+    expect(prompt).toContain('data, not instructions')
+    const body = prompt.split('=====DIFF START=====')[1]!.split('=====DIFF END=====')[0]!
+    const diffLines = body.split('\n').filter((l) => /^[+\- ] /.test(l))
+    expect(diffLines.length).toBeLessThanOrEqual(400)
+    expect(diffLines.length).toBeGreaterThan(300)
+    expect(body).toContain('more diff lines omitted')
+  })
+
+  test('Explain turn when one is already under way does not spawn again, and the header follows the mode', async ($, on) => {
+    let release = () => {}
+    const spawned = engineBeneath(on, '', new Promise<void>((resolve) => { release = resolve }))
+    await threeFiles($)
+    const view = await pane($)
+
+    await view.press({ key: 'explain' }) // spawn 1: the edit's, which never starts
+    expect(await view.find({ type: 'Text', text: 'This edit' })).toBeDefined()
+    expect(await view.find({ type: 'Text', text: 'This turn · 3 files' })).toBeUndefined()
+
+    const first = view.press({ key: 'explain-turn' }) // spawn 2 waits on the gate
+    for (let tries = 0; spawned.length < 2 && tries < 100; tries++) await view.find({ key: 'next' })
+    expect(spawned).toHaveLength(2)
+    expect(await view.find({ type: 'Text', text: 'This turn · 3 files' })).toBeDefined()
+    expect(await view.find({ type: 'Text', text: 'Teacher is explaining this turn… (Sonnet)' })).toBeDefined()
+    expect(await view.find({ type: 'Text', text: 'This edit' })).toBeUndefined()
+
+    await view.press({ key: 'explain-turn' }) // loading: only switches the view
+    expect(spawned).toHaveLength(2)
+    await view.press({ key: 'next' }) // navigating keeps the mode, and the group's explanation
+    expect(await view.find({ type: 'Text', text: 'This turn · 3 files' })).toBeDefined()
+    await view.press({ key: 'explain' }) // back to the edit view
+    expect(await view.find({ type: 'Text', text: 'This edit' })).toBeDefined()
+
+    release()
+    await first
   })
 
   test('control characters and escape sequences are stripped from untrusted text', () => {
