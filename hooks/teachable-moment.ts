@@ -25,6 +25,8 @@ const TURN_DIFF_BUDGET = 400 // diff lines in a whole turn's prompt
 const TURN_MIN_PER_STEP = 20
 const MAX_AGENTS = 20 // subagents whose uncommitted edits are held at once
 const MAX_AGENT_TYPES = 50
+const MAX_SPAWNED = 50 // Teacher loop ids remembered
+const FALLBACK_TYPE = 'subagent'
 const MAX_TYPE_CHARS = 30
 const EXPLAIN_LINES = 6
 const PANE_ROWS = 30
@@ -318,7 +320,7 @@ export type State = {
   pending: readonly Draft[] // the main loop's edits, committed at its turn.complete
   pendingSub: Map<string, readonly Draft[]> // each subagent's, committed at its own
   spawned: Set<string> // agents this mod started (the Teacher's loops): never recorded
-  agentTypes: Map<string, string>
+  agentTypes: Map<string, { type: string; lookups: number }> // by agent id
   steps: readonly Step[]
   turns: number
   nextId: number
@@ -358,19 +360,24 @@ const hasStep = (s: State, stepId: number) => s.steps.some((x) => x.id === stepI
 
 // Turns drafts into the steps of a new group, numbered by the one counter all
 // groups share, keeping the last MAX_STEPS. Steps dropped at the cap lose their
-// explanations (a group's too, once none of its steps is left), and a viewer who
-// was on one moves to the oldest step left, not to the newest. True when something
-// was committed.
-function commitDrafts(s: State, drafts: readonly Draft[], who = ''): boolean {
+// explanations (a group's too as soon as any one of its steps goes, so the
+// header and the explanation never describe missing steps; a turn explanation
+// still being fetched for it is given up), and a viewer who was on one moves to
+// the oldest step left, not to the newest. True when something was committed.
+export function commitDrafts(s: State, drafts: readonly Draft[], who = ''): boolean {
   if (!drafts.length) return false
   s.turns++
   const label = who ? `turn ${s.turns} · ${who}` : `turn ${s.turns}`
   const committed = drafts.map((d) => ({ ...d, id: s.nextId++, turn: s.turns, label }))
-  s.steps = [...s.steps, ...committed].slice(-MAX_STEPS)
+  const all = [...s.steps, ...committed]
+  s.steps = all.slice(-MAX_STEPS)
   const kept = new Set(s.steps.map((x) => x.id))
   for (const id of [...s.explanations.keys()]) if (!kept.has(id)) s.explanations.delete(id)
-  const keptTurns = new Set(s.steps.map((x) => x.turn))
-  for (const n of [...s.groupExplanations.keys()]) if (!keptTurns.has(n)) s.groupExplanations.delete(n)
+  const cutTurns = new Set(all.slice(0, all.length - s.steps.length).map((x) => x.turn))
+  for (const n of cutTurns) s.groupExplanations.delete(n)
+  for (const [agentId, w] of [...s.waiting]) {
+    if (w.target.kind === 'turn' && cutTurns.has(w.target.id)) { s.waiting.delete(agentId); w.cancel() }
+  }
   if (s.currentId && !kept.has(s.currentId)) s.currentId = s.steps[0]!.id
   return true
 }
@@ -383,34 +390,41 @@ function commitPending(s: State): boolean {
 
 // Holds a subagent's edits until its own turn ends; past MAX_AGENTS agents the
 // oldest one's go, so a subagent that never finishes cannot grow this forever.
+// Each hold moves the agent to the back, so the one that goes is the least recently active.
 function holdForAgent(s: State, agentId: string, drafts: readonly Draft[]) {
-  const held = s.pendingSub.get(agentId) ?? []
-  if (!s.pendingSub.has(agentId) && s.pendingSub.size >= MAX_AGENTS) s.pendingSub.delete(s.pendingSub.keys().next().value!)
-  s.pendingSub.set(agentId, [...held, ...drafts])
+  const held = s.pendingSub.get(agentId)
+  s.pendingSub.delete(agentId)
+  if (!held && s.pendingSub.size >= MAX_AGENTS) s.pendingSub.delete(s.pendingSub.keys().next().value!)
+  s.pendingSub.set(agentId, [...(held ?? []), ...drafts])
 }
 
 // What to call a subagent in a group's label: its type from `$.agent.list()`.
-// Looked up once and cached (the list drops an agent soon after it ends); a
-// failed lookup is not cached, so the next call tries again.
-async function agentTypeOf($: Engine, s: State, agentId: string): Promise<string> {
+// Looked up at its first edit (the list drops an agent soon after it ends); the
+// entry is made before the lookup starts, so edits that follow don't repeat it,
+// and a failed or empty lookup stays the fallback. At commit time (`retry`) a
+// fallback gets one more lookup, and no agent is looked up more than twice.
+async function agentTypeOf($: Engine, s: State, agentId: string, retry = false): Promise<string> {
   const cached = s.agentTypes.get(agentId)
-  if (cached) return cached
+  if (cached && (cached.type !== FALLBACK_TYPE || !retry || cached.lookups >= 2)) return cached.type
+  const lookups = (cached?.lookups ?? 0) + 1
+  if (!cached && s.agentTypes.size >= MAX_AGENT_TYPES) s.agentTypes.delete(s.agentTypes.keys().next().value!)
+  s.agentTypes.set(agentId, { type: FALLBACK_TYPE, lookups })
   try {
     const found = (await $.agent.list()).find((a) => a.id === agentId)
     const type = cleanText(String(found?.type ?? '')).replace(/\s+/g, ' ').trim().slice(0, MAX_TYPE_CHARS)
     if (type) {
-      if (s.agentTypes.size >= MAX_AGENT_TYPES) s.agentTypes.delete(s.agentTypes.keys().next().value!)
-      s.agentTypes.set(agentId, type)
+      s.agentTypes.set(agentId, { type, lookups })
       return type
     }
   } catch { /* the label falls back */ }
-  return 'subagent'
+  return FALLBACK_TYPE
 }
 
 // An agent loop this mod started (the Teacher's): its edits and turns are never recorded.
 export const isOurs = (s: Pick<State, 'spawned' | 'waiting'>, agentId: string) => s.spawned.has(agentId) || s.waiting.has(agentId)
 
 // A Teacher turn that ended before spawn() handed back its id: keep the last few.
+// Not for a subagent we already know of, so a busy one cannot push a Teacher's answer out.
 function rememberEarly(s: State, agentId: string, e: Finished) {
   if (s.early.size >= MAX_EARLY) s.early.delete(s.early.keys().next().value!)
   s.early.set(agentId, { reason: e.reason, answer: e.answer, isAborted: e.isAborted })
@@ -454,6 +468,7 @@ async function explain($: Engine, s: State, target: Target) {
     })
     const agentId = started.agentId
     if (started.deny !== undefined || !agentId) return fail($, s, target, shortReason(started.deny ?? 'it did not start'))
+    if (s.spawned.size >= MAX_SPAWNED) s.spawned.delete(s.spawned.keys().next().value!)
     s.spawned.add(agentId)
     const timer = $.clock.after(target.kind === 'edit' ? EXPLAIN_TIMEOUT_MS : TURN_EXPLAIN_TIMEOUT_MS, () => {
       if (!s.waiting.delete(agentId)) return
@@ -688,7 +703,7 @@ export const register: Register = (on, options) => {
     if (drafts.length && !failed) {
       if (agentId) {
         holdForAgent(s, agentId, drafts)
-        await agentTypeOf($, s, agentId) // caches the type now, while the agent is still listed
+        void quiet(agentTypeOf($, s, agentId)) // caches the type while the agent is still listed; the edit does not wait
       } else s.pending = [...s.pending, ...drafts]
     }
     return r
@@ -705,13 +720,13 @@ export const register: Register = (on, options) => {
     if (agentId) {
       try {
         if (s.waiting.has(agentId)) settle($, s, agentId, e)
-        else if (s.spawning > 0) rememberEarly(s, agentId, e)
+        else if (s.spawning > 0 && !s.pendingSub.has(agentId) && !s.agentTypes.has(agentId)) rememberEarly(s, agentId, e)
       } catch { /* a drawing failure must not hide the commit below */ }
       try {
         const drafts = s.pendingSub.get(agentId)
         if (drafts?.length && !isOurs(s, agentId)) {
           s.pendingSub.delete(agentId)
-          const type = await agentTypeOf($, s, agentId)
+          const type = await agentTypeOf($, s, agentId, true)
           if (commitDrafts(s, drafts, type)) redraw($)
         }
       } catch { /* a drawing failure must not undo or hide the commit */ }

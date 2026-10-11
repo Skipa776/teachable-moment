@@ -2,7 +2,8 @@ import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { allocateBudget, cleanText, explanationFor, isOurs, orderSteps, parseExplanation, wrapText } from '../hooks/teachable-moment'
+import type { State } from '../hooks/teachable-moment'
+import { allocateBudget, cleanText, commitDrafts, explanationFor, isOurs, orderSteps, parseExplanation, wrapText } from '../hooks/teachable-moment'
 
 const PLUGIN = 'teachable-moment'
 const PANE_PROPS = {
@@ -95,6 +96,21 @@ describe('recording', () => {
     await $.tool.call(edit('/p/a.ts', 'one', 'two', { agentId: 'sub1' }))
     await endTurn($, 'sub-turn', 'sub1')
     expect(await (await pane($)).find({ type: 'Text', text: 'turn 1 · subagent · step 1 of 1' })).toBeDefined()
+  })
+
+  test('an agent whose lookup fails is labelled "subagent" and is looked up at most twice', async ($, on) => {
+    engineBeneath(on)
+    let lookups = 0
+    on('agent.list', () => { lookups++; throw new Error('list is down') })
+    for (let i = 0; i < 5; i++) await $.tool.call(edit(`/p/f${i}.ts`, 'a', 'b', { agentId: 'sub1' }))
+    await endTurn($, 'sub-turn', 'sub1')
+    await $.tool.call(edit('/p/g.ts', 'a', 'b', { agentId: 'sub1' }))
+    await $.tool.call(edit('/p/h.ts', 'a', 'b', { agentId: 'sub1' }))
+    await endTurn($, 'sub-turn-2', 'sub1')
+    expect(lookups).toBeLessThanOrEqual(2)
+    const view = await pane($)
+    expect(await view.find({ type: 'Text', text: 'turn 2 · subagent · step 1 of 7' })).toBeDefined()
+    expect(await view.find({ type: 'Text', text: /^turn 1 · subagent/ })).toBeUndefined() // not on this step
   })
 
   test('a subagent turn commits only its own edits, the main turn only the main ones', async ($, on) => {
@@ -369,6 +385,29 @@ describe('explaining', () => {
 
     release()
     await first
+  })
+
+  test('a group that loses any step to the cap loses its cached explanation, and one being fetched is given up', () => {
+    const state = {
+      steps: [], turns: 0, nextId: 1, currentId: 0,
+      explanations: new Map(), groupExplanations: new Map(), waiting: new Map(),
+    } as unknown as State
+    const drafts = (n: number) => Array.from({ length: n }, (_, i) => ({ tool: 'Edit', file: `f${i}`, absPath: `/p/f${i}`, diff: [], note: '' }))
+    const done = { status: 'done' as const, high: 'h', low: 'l', scroll: 0 }
+    let cancelled = 0
+    commitDrafts(state, drafts(150)) // group 1
+    commitDrafts(state, drafts(50)) // group 2: 200 steps, nothing cut
+    state.groupExplanations.set(1, done)
+    state.groupExplanations.set(2, done)
+    state.waiting.set('t1', { target: { kind: 'turn', id: 1 }, cancel: () => { cancelled++ } })
+    state.waiting.set('t2', { target: { kind: 'turn', id: 2 }, cancel: () => { cancelled++ } })
+    expect([...state.groupExplanations.keys()]).toEqual([1, 2])
+
+    commitDrafts(state, drafts(1)) // group 3 cuts one step of group 1
+    expect([...state.groupExplanations.keys()]).toEqual([2])
+    expect([...state.waiting.keys()]).toEqual(['t2'])
+    expect(cancelled).toBe(1)
+    expect(state.steps).toHaveLength(200)
   })
 
   test('control characters and escape sequences are stripped from untrusted text', () => {
